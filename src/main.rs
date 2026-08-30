@@ -459,19 +459,21 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
                 .len()
                 .checked_add(match_length)
                 .ok_or_else(|| invalid("XPRESS-Huffman match output overflow"))?;
+            let copy_length = match_length.min(output_size - output.len());
             if match_end > output_size {
-                return Err(invalid(format!(
-                    "XPRESS-Huffman match in block {block_number} overruns the declared output \
-                     by {:#x} bytes at output {:#x}",
-                    match_end - output_size,
-                    output.len()
-                )));
+                eprintln!(
+                    "    XPRESS record-final match: clipping {match_length:#x} to \
+                     {copy_length:#x} bytes at output {:#x} ({:#x} byte padding overrun)",
+                    output.len(),
+                    match_end - output_size
+                );
             }
 
             // A match may cross the nominal 64 KiB block end.  MS-XCA tests
-            // the block boundary only before decoding the next symbol, so the
-            // complete match belongs in the output.
-            for _ in 0..match_length {
+            // that boundary only before decoding the next symbol.  Preserve
+            // such internal crossings, but discard encoder padding beyond the
+            // SBCT record's explicitly declared output size.
+            for _ in 0..copy_length {
                 let byte = output[output.len() - match_offset];
                 output.push(byte);
             }
