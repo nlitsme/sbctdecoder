@@ -104,6 +104,7 @@ fn check_output_range(
 
 const XPRESS_SYMBOLS: usize = 512;
 const XPRESS_TABLE_BYTES: usize = XPRESS_SYMBOLS / 2;
+const XPRESS_BLOCK_SIZE: usize = 1 << 16;
 const NO_NODE: usize = usize::MAX;
 
 #[derive(Clone, Copy)]
@@ -122,36 +123,35 @@ struct XpressBitStream<'a> {
 
 impl<'a> XpressBitStream<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self {
+        let mut stream = Self {
             data,
             position: 0,
             bits: 0,
             available: 0,
-        }
+        };
+        stream.bits = (stream.read_u16() << 16) | stream.read_u16();
+        stream.available = 32;
+        stream
     }
 
     fn read_u16(&mut self) -> u32 {
-        let lo = self.data.get(self.position).copied().unwrap_or(0);
-        let hi = self.data.get(self.position + 1).copied().unwrap_or(0);
-        self.position = self.position.saturating_add(2);
-        u32::from(lo) | (u32::from(hi) << 8)
+        let available = self.data.len().saturating_sub(self.position);
+        let value = match available {
+            0 => 0,
+            1 => u32::from(self.data[self.position]) << 8,
+            _ => u32::from(u16::from_le_bytes([
+                self.data[self.position],
+                self.data[self.position + 1],
+            ])),
+        };
+        self.position += available.min(2);
+        value
     }
 
     fn read_byte(&mut self) -> u8 {
         let byte = self.data.get(self.position).copied().unwrap_or(0);
         self.position = self.position.saturating_add(1);
         byte
-    }
-
-    // XPRESS bit coding uses little-endian 16-bit units whose bits are
-    // consumed most-significant first.  Fetch units only when required:
-    // literal match-length bytes are interleaved at `position`, so eagerly
-    // prefetching an extra unit would make those byte reads skip two bytes.
-    fn ensure(&mut self, count: u32) {
-        if self.available < count {
-            self.bits |= self.read_u16() << (16 - self.available);
-            self.available += 16;
-        }
     }
 
     fn peek(&self, count: u32) -> u32 {
@@ -165,6 +165,10 @@ impl<'a> XpressBitStream<'a> {
     fn consume(&mut self, count: u32) {
         self.bits = self.bits.wrapping_shl(count);
         self.available -= count;
+        if self.available < 16 {
+            self.bits |= self.read_u16() << (16 - self.available);
+            self.available += 16;
+        }
     }
 }
 
@@ -242,7 +246,6 @@ fn decode_xpress_symbol(
     stream: &mut XpressBitStream<'_>,
     nodes: &[HuffmanNode],
 ) -> io::Result<u16> {
-    stream.ensure(15);
     let mut node_index = 0usize;
     loop {
         let node = nodes
@@ -262,66 +265,118 @@ fn decode_xpress_symbol(
 }
 
 fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Result<Vec<u8>> {
-    let tree = build_xpress_tree(compressed)?;
-    let bitstream_data = compressed
-        .get(XPRESS_TABLE_BYTES..)
-        .ok_or_else(|| invalid("truncated XPRESS-Huffman stream"))?;
-    let mut stream = XpressBitStream::new(bitstream_data);
     let mut output = Vec::with_capacity(output_size);
+    let mut compressed_position = 0usize;
+    let mut block_number = 0usize;
 
-    // SBCT records use one Huffman table for the entire compressed record.
-    // In particular, there is no new table at each 64 KiB output boundary.
-    while output.len() < output_size {
-        let symbol = decode_xpress_symbol(&mut stream, &tree)?;
+    while output.len() < output_size && compressed_position < compressed.len() {
+        let table_end = compressed_position
+            .checked_add(XPRESS_TABLE_BYTES)
+            .ok_or_else(|| invalid("XPRESS-Huffman table offset overflow"))?;
+        let table = compressed
+            .get(compressed_position..table_end)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "truncated XPRESS-Huffman table for block {block_number} at payload offset \
+                     {compressed_position:#x}"
+                ))
+            })?;
+        let tree = build_xpress_tree(table)?;
+        let table_position = compressed_position;
+        compressed_position = table_end;
 
-        if symbol < 256 {
-            output.push(symbol as u8);
-            continue;
-        }
+        let block_output_start = output.len();
+        let mut produced_in_block = 0usize;
+        let bitstream_position = compressed_position;
+        let mut stream = XpressBitStream::new(&compressed[bitstream_position..]);
 
-        let match_symbol = u32::from(symbol) - 256;
-        let offset_bits = match_symbol >> 4;
-        stream.ensure(16);
-        let match_offset = (1usize << offset_bits)
-            | usize::try_from(stream.peek(offset_bits)).unwrap();
-        stream.consume(offset_bits);
+        while produced_in_block < XPRESS_BLOCK_SIZE && output.len() < output_size {
+            let symbol = decode_xpress_symbol(&mut stream, &tree)?;
 
-        let length_header = match_symbol & 0x0f;
-        let mut match_length = length_header;
-        if length_header == 0x0f {
-            match_length = u32::from(stream.read_byte()) + 0x0f;
-            if match_length == 0x10e {
-                let lo = u32::from(stream.read_byte());
-                let hi = u32::from(stream.read_byte());
-                match_length = lo | (hi << 8);
+            if symbol < 256 {
+                output.push(symbol as u8);
+                produced_in_block += 1;
+                continue;
             }
-        }
-        match_length += 3;
-        let match_length = usize::try_from(match_length).unwrap();
 
-        if match_offset == 0 || match_offset > output.len() {
+            let match_symbol = u32::from(symbol) - 256;
+            let offset_bits = match_symbol >> 4;
+            let match_offset = (1usize << offset_bits)
+                | usize::try_from(stream.peek(offset_bits)).unwrap();
+
+            // The extended match length is a raw byte (or word) interleaved at
+            // the compressed-byte cursor.  Read it before consuming the offset
+            // bits: consuming those bits may refill the bit buffer and advance
+            // that cursor.
+            let length_header = match_symbol & 0x0f;
+            let mut match_length = length_header;
+            if length_header == 0x0f {
+                match_length = u32::from(stream.read_byte()) + 0x0f;
+                if match_length == 0x10e {
+                    match_length = stream.read_u16();
+                }
+            }
+            match_length += 3;
+            let match_length = usize::try_from(match_length).unwrap();
+            stream.consume(offset_bits);
+
+            if match_offset == 0 || match_offset > output.len() {
+                return Err(invalid(format!(
+                    "XPRESS-Huffman match offset {match_offset:#x} precedes output; block \
+                     {block_number}, output position {:#x}, block output position {:#x}, \
+                     payload byte position {:#x}, symbol {symbol:#x}, match symbol \
+                     {match_symbol:#x}, offset bits {offset_bits}, match length {match_length:#x}",
+                    output.len(),
+                    output.len() - block_output_start,
+                    bitstream_position.saturating_add(stream.position)
+                )));
+            }
+            if match_length > output_size - output.len() {
+                return Err(invalid(format!(
+                    "XPRESS-Huffman match in block {block_number} overruns the record output \
+                     by {:#x} bytes at output {:#x}",
+                    match_length - (output_size - output.len()),
+                    output.len()
+                )));
+            }
+
+            for _ in 0..match_length {
+                let byte = output[output.len() - match_offset];
+                output.push(byte);
+            }
+            produced_in_block += match_length;
+        }
+
+        let block_output_end = output.len();
+        compressed_position = bitstream_position.saturating_add(stream.position);
+        if compressed_position > compressed.len() {
             return Err(invalid(format!(
-                "XPRESS-Huffman match offset {match_offset:#x} precedes output; \
-                 output position {:#x}, bitstream byte position {:#x} \
-                 (payload position about {:#x}), symbol {symbol:#x}, \
-                 match symbol {match_symbol:#x}, offset bits {offset_bits}, \
-                 match length {match_length:#x}",
-                output.len(),
-                stream.position,
-                XPRESS_TABLE_BYTES.saturating_add(stream.position)
+                "XPRESS-Huffman block {block_number} read past the compressed payload by \
+                 {:#x} bytes",
+                compressed_position - compressed.len()
             )));
         }
-        if match_length > output_size - output.len() {
-            return Err(invalid(format!(
-                "XPRESS-Huffman match overruns output by {:#x} bytes",
-                match_length - (output_size - output.len())
-            )));
-        }
+        eprintln!(
+            "    XPRESS block {block_number:4}: table {table_position:#08x}, bitstream \
+             {bitstream_position:#08x}..{compressed_position:#08x}, output \
+             {block_output_start:#010x}..{block_output_end:#010x}, produced \
+             {produced_in_block:#x}"
+        );
+        block_number += 1;
+    }
 
-        for _ in 0..match_length {
-            let byte = output[output.len() - match_offset];
-            output.push(byte);
-        }
+    if output.len() < output_size {
+        eprintln!(
+            "    XPRESS sparse tail: output {:#x}..{output_size:#x} ({:#x} implicit zero bytes)",
+            output.len(),
+            output_size - output.len()
+        );
+    } else if compressed_position != compressed.len() {
+        eprintln!(
+            "    XPRESS trailing payload: {:#x} bytes at {compressed_position:#x}..{:#x}",
+            compressed.len() - compressed_position,
+            compressed.len()
+        );
     }
 
     Ok(output)
@@ -555,12 +610,13 @@ fn process_file(
 
         println!(
             "record {:5}  file {:#010x}  index {:5}  output {:#012x}..{:#012x}  \
-             plain {:#x}  compressed {:#x}  algorithm {}  tag {:#018x}",
+             decoded {:#x}/{:#x}  compressed {:#x}  algorithm {}  tag {:#018x}",
             *record_number,
             file_offset,
             header.index,
             header.logical_offset,
             output_end,
+            plain.len(),
             header.plain_size,
             header.compressed_size,
             header.algorithm,
