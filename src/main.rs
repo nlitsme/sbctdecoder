@@ -331,20 +331,21 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
                     bitstream_position.saturating_add(stream.position)
                 )));
             }
-            if match_length > output_size - output.len() {
-                return Err(invalid(format!(
-                    "XPRESS-Huffman match in block {block_number} overruns the record output \
-                     by {:#x} bytes at output {:#x}",
-                    match_length - (output_size - output.len()),
+            let remaining_output = output_size - output.len();
+            let copy_length = match_length.min(remaining_output);
+            if copy_length != match_length {
+                eprintln!(
+                    "    XPRESS block {block_number:4}: clipping final match from \
+                     {match_length:#x} to {copy_length:#x} bytes at output {:#x}",
                     output.len()
-                )));
+                );
             }
 
-            for _ in 0..match_length {
+            for _ in 0..copy_length {
                 let byte = output[output.len() - match_offset];
                 output.push(byte);
             }
-            produced_in_block += match_length;
+            produced_in_block += copy_length;
         }
 
         let block_output_end = output.len();
