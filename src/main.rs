@@ -286,16 +286,17 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
         compressed_position = table_end;
 
         let block_output_start = output.len();
-        let mut produced_in_block = 0usize;
+        let block_output_limit = block_output_start
+            .saturating_add(XPRESS_BLOCK_SIZE)
+            .min(output_size);
         let bitstream_position = compressed_position;
         let mut stream = XpressBitStream::new(&compressed[bitstream_position..]);
 
-        while produced_in_block < XPRESS_BLOCK_SIZE && output.len() < output_size {
+        while output.len() < block_output_limit {
             let symbol = decode_xpress_symbol(&mut stream, &tree)?;
 
             if symbol < 256 {
                 output.push(symbol as u8);
-                produced_in_block += 1;
                 continue;
             }
 
@@ -331,11 +332,11 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
                     bitstream_position.saturating_add(stream.position)
                 )));
             }
-            let remaining_output = output_size - output.len();
-            let copy_length = match_length.min(remaining_output);
+            let remaining_in_block = block_output_limit - output.len();
+            let copy_length = match_length.min(remaining_in_block);
             if copy_length != match_length {
                 eprintln!(
-                    "    XPRESS block {block_number:4}: clipping final match from \
+                    "    XPRESS block {block_number:4}: clipping block-final match from \
                      {match_length:#x} to {copy_length:#x} bytes at output {:#x}",
                     output.len()
                 );
@@ -345,7 +346,6 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
                 let byte = output[output.len() - match_offset];
                 output.push(byte);
             }
-            produced_in_block += copy_length;
         }
 
         let block_output_end = output.len();
@@ -360,8 +360,8 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
         eprintln!(
             "    XPRESS block {block_number:4}: table {table_position:#08x}, bitstream \
              {bitstream_position:#08x}..{compressed_position:#08x}, output \
-             {block_output_start:#010x}..{block_output_end:#010x}, produced \
-             {produced_in_block:#x}"
+             {block_output_start:#010x}..{block_output_end:#010x}, produced {:#x}",
+            block_output_end - block_output_start
         );
         block_number += 1;
     }
@@ -442,7 +442,12 @@ fn print_record_header(
     eprintln!("  payload file range:  {payload_file_offset:#x}..{payload_end:#x}");
     eprintln!("  payload first bytes: {preview}");
 
-    if header.algorithm == 4 && compressed.len() >= XPRESS_TABLE_BYTES {
+    let stored_uncompressed =
+        usize::try_from(header.plain_size).ok() == Some(compressed.len());
+
+    if header.algorithm == 4 && stored_uncompressed {
+        eprintln!("  storage mode:         raw fallback (stored size equals plain size)");
+    } else if header.algorithm == 4 && compressed.len() >= XPRESS_TABLE_BYTES {
         let mut histogram = [0usize; 16];
         for byte in &compressed[..XPRESS_TABLE_BYTES] {
             histogram[usize::from(byte & 0x0f)] += 1;
@@ -482,7 +487,15 @@ fn decompress(header: &RecordHeader, compressed: &[u8]) -> io::Result<Vec<u8>> {
             Ok(compressed.to_vec())
         }
 
-        // Windows CompressAlgorithm::XpressHuff.
+        // Windows CompressAlgorithm::XpressHuff. SBCT retains algorithm 4 in
+        // the header when compression is not beneficial, but stores such a
+        // record verbatim. Equal stored/plain sizes identify that fallback.
+        4 if compressed.len() == expected_size => {
+            eprintln!(
+                "    payload stored uncompressed: {expected_size:#x} bytes"
+            );
+            Ok(compressed.to_vec())
+        }
         4 => decompress_xpress_huffman(compressed, expected_size),
 
         algorithm => Err(invalid(format!(
