@@ -455,17 +455,23 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
                     bitstream_position.saturating_add(stream.position)
                 )));
             }
-            let remaining_in_block = block_output_limit - output.len();
-            let copy_length = match_length.min(remaining_in_block);
-            if copy_length != match_length {
-                eprintln!(
-                    "    XPRESS block {block_number:4}: clipping block-final match from \
-                     {match_length:#x} to {copy_length:#x} bytes at output {:#x}",
+            let match_end = output
+                .len()
+                .checked_add(match_length)
+                .ok_or_else(|| invalid("XPRESS-Huffman match output overflow"))?;
+            if match_end > output_size {
+                return Err(invalid(format!(
+                    "XPRESS-Huffman match in block {block_number} overruns the declared output \
+                     by {:#x} bytes at output {:#x}",
+                    match_end - output_size,
                     output.len()
-                );
+                )));
             }
 
-            for _ in 0..copy_length {
+            // A match may cross the nominal 64 KiB block end.  MS-XCA tests
+            // the block boundary only before decoding the next symbol, so the
+            // complete match belongs in the output.
+            for _ in 0..match_length {
                 let byte = output[output.len() - match_offset];
                 output.push(byte);
             }
@@ -490,12 +496,12 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
     }
 
     if output.len() < output_size {
-        eprintln!(
-            "    XPRESS sparse tail: output {:#x}..{output_size:#x} ({:#x} implicit zero bytes)",
-            output.len(),
-            output_size - output.len()
-        );
-    } else if compressed_position != compressed.len() {
+        return Err(invalid(format!(
+            "XPRESS-Huffman payload ended after producing {:#x} of {output_size:#x} bytes",
+            output.len()
+        )));
+    }
+    if compressed_position != compressed.len() {
         eprintln!(
             "    XPRESS trailing payload: {:#x} bytes at {compressed_position:#x}..{:#x}",
             compressed.len() - compressed_position,
