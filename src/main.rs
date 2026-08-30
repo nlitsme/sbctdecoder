@@ -295,7 +295,14 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
 
         if match_offset == 0 || match_offset > output.len() {
             return Err(invalid(format!(
-                "XPRESS-Huffman match offset {match_offset:#x} precedes output"
+                "XPRESS-Huffman match offset {match_offset:#x} precedes output; \
+                 output position {:#x}, bitstream byte position {:#x} \
+                 (payload position about {:#x}), symbol {symbol:#x}, \
+                 match symbol {match_symbol:#x}, offset bits {offset_bits}, \
+                 match length {match_length:#x}",
+                output.len(),
+                stream.position,
+                XPRESS_TABLE_BYTES.saturating_add(stream.position)
             )));
         }
         if match_length > output_size - output.len() {
@@ -312,6 +319,88 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
     }
 
     Ok(output)
+}
+
+fn algorithm_name(algorithm: u32) -> &'static str {
+    match algorithm {
+        1 => "uncompressed",
+        4 => "XPRESS-Huffman",
+        _ => "unknown",
+    }
+}
+
+fn print_record_header(
+    input_path: &Path,
+    input_size: u64,
+    record_number: u64,
+    file_offset: u64,
+    record_end: u64,
+    payload_file_offset: u64,
+    header: &RecordHeader,
+    compressed: &[u8],
+) {
+    let output_end = header.logical_offset.saturating_add(header.plain_size);
+    let payload_end = payload_file_offset.saturating_add(u64::from(header.compressed_size));
+    let preview = compressed
+        .iter()
+        .take(32)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    eprintln!("record {record_number} header:");
+    eprintln!("  source:              {}", input_path.display());
+    eprintln!("  source file size:    {input_size:#x} ({input_size})");
+    eprintln!("  record file range:   {file_offset:#x}..{record_end:#x}");
+    eprintln!("  magic:               {RECORD_MAGIC:#010x}");
+    eprintln!(
+        "  outer record size:   {:#x} ({})",
+        header.record_size, header.record_size
+    );
+    eprintln!("  record index:        {:#x} ({})", header.index, header.index);
+    eprintln!(
+        "  algorithm:           {:#x} ({}, {})",
+        header.algorithm,
+        header.algorithm,
+        algorithm_name(header.algorithm)
+    );
+    eprintln!(
+        "  plain size:          {:#x} ({})",
+        header.plain_size, header.plain_size
+    );
+    eprintln!("  logical offset:      {:#x}", header.logical_offset);
+    eprintln!("  logical output end:  {output_end:#x}");
+    eprintln!("  tag/checksum:        {:#018x}", header.tag);
+    eprintln!("  inner plain size 1:  {:#x}", header.inner_size_1);
+    eprintln!("  inner plain size 2:  {:#x}", header.inner_size_2);
+    eprintln!(
+        "  compressed size:     {:#x} ({})",
+        header.compressed_size, header.compressed_size
+    );
+    eprintln!("  payload file range:  {payload_file_offset:#x}..{payload_end:#x}");
+    eprintln!("  payload first bytes: {preview}");
+
+    if header.algorithm == 4 && compressed.len() >= XPRESS_TABLE_BYTES {
+        let mut histogram = [0usize; 16];
+        for byte in &compressed[..XPRESS_TABLE_BYTES] {
+            histogram[usize::from(byte & 0x0f)] += 1;
+            histogram[usize::from(byte >> 4)] += 1;
+        }
+        let nonzero_symbols = XPRESS_SYMBOLS - histogram[0];
+        let histogram = histogram
+            .iter()
+            .enumerate()
+            .map(|(length, count)| format!("{length}:{count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("  Huffman table bytes: {XPRESS_TABLE_BYTES:#x}");
+        eprintln!("  coded symbols:       {nonzero_symbols}/{XPRESS_SYMBOLS}");
+        eprintln!("  code-length counts:  {histogram}");
+        eprintln!(
+            "  bitstream file start:{:#x}",
+            payload_file_offset.saturating_add(XPRESS_TABLE_BYTES as u64)
+        );
+    }
 }
 
 fn decompress(header: &RecordHeader, compressed: &[u8]) -> io::Result<Vec<u8>> {
@@ -421,6 +510,17 @@ fn process_file(
         let mut compressed = vec![0u8; payload_size];
         input.seek(SeekFrom::Start(payload_file_offset))?;
         input.read_exact(&mut compressed)?;
+
+        print_record_header(
+            input_path,
+            input_size,
+            *record_number,
+            file_offset,
+            record_end,
+            payload_file_offset,
+            &header,
+            &compressed,
+        );
 
         let plain = decompress(&header, &compressed).map_err(|error| {
             invalid(format!(
