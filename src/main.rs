@@ -122,15 +122,12 @@ struct XpressBitStream<'a> {
 
 impl<'a> XpressBitStream<'a> {
     fn new(data: &'a [u8]) -> Self {
-        let mut stream = Self {
+        Self {
             data,
             position: 0,
             bits: 0,
             available: 0,
-        };
-        stream.bits = (stream.read_u16() << 16) | stream.read_u16();
-        stream.available = 32;
-        stream
+        }
     }
 
     fn read_u16(&mut self) -> u32 {
@@ -146,6 +143,17 @@ impl<'a> XpressBitStream<'a> {
         byte
     }
 
+    // XPRESS bit coding uses little-endian 16-bit units whose bits are
+    // consumed most-significant first.  Fetch units only when required:
+    // literal match-length bytes are interleaved at `position`, so eagerly
+    // prefetching an extra unit would make those byte reads skip two bytes.
+    fn ensure(&mut self, count: u32) {
+        if self.available < count {
+            self.bits |= self.read_u16() << (16 - self.available);
+            self.available += 16;
+        }
+    }
+
     fn peek(&self, count: u32) -> u32 {
         if count == 0 {
             0
@@ -157,10 +165,6 @@ impl<'a> XpressBitStream<'a> {
     fn consume(&mut self, count: u32) {
         self.bits = self.bits.wrapping_shl(count);
         self.available -= count;
-        if self.available < 16 {
-            self.bits |= self.read_u16() << (16 - self.available);
-            self.available += 16;
-        }
     }
 }
 
@@ -238,6 +242,7 @@ fn decode_xpress_symbol(
     stream: &mut XpressBitStream<'_>,
     nodes: &[HuffmanNode],
 ) -> io::Result<u16> {
+    stream.ensure(15);
     let mut node_index = 0usize;
     loop {
         let node = nodes
@@ -276,6 +281,7 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
 
         let match_symbol = u32::from(symbol) - 256;
         let offset_bits = match_symbol >> 4;
+        stream.ensure(16);
         let match_offset = (1usize << offset_bits)
             | usize::try_from(stream.peek(offset_bits)).unwrap();
         stream.consume(offset_bits);
