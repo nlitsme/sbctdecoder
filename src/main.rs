@@ -10,6 +10,125 @@ const OUTER_HEADER_SIZE: u64 = 0x20;
 const INNER_HEADER_SIZE: u64 = 0x1c;
 const PAYLOAD_OFFSET: u64 = OUTER_HEADER_SIZE + INNER_HEADER_SIZE;
 
+struct InputSegment {
+    path: PathBuf,
+    file: File,
+    stream_start: u64,
+    size: u64,
+}
+
+struct SegmentedInput {
+    segments: Vec<InputSegment>,
+    position: u64,
+    size: u64,
+}
+
+impl SegmentedInput {
+    fn open(paths: &[String]) -> io::Result<Self> {
+        let mut segments = Vec::with_capacity(paths.len());
+        let mut stream_start = 0u64;
+
+        for name in paths {
+            let path = PathBuf::from(name);
+            let file = File::open(&path)?;
+            let size = file.metadata()?.len();
+            segments.push(InputSegment {
+                path,
+                file,
+                stream_start,
+                size,
+            });
+            stream_start = checked_add(stream_start, size, "input stream size")?;
+        }
+
+        Ok(Self {
+            segments,
+            position: 0,
+            size: stream_start,
+        })
+    }
+
+    fn segment_index(&self, position: u64) -> Option<usize> {
+        self.segments.iter().position(|segment| {
+            position >= segment.stream_start
+                && position < segment.stream_start.saturating_add(segment.size)
+        })
+    }
+
+    fn describe_position(&self, position: u64) -> String {
+        if let Some(index) = self.segment_index(position) {
+            let segment = &self.segments[index];
+            return format!(
+                "{}:{:#x}",
+                segment.path.display(),
+                position - segment.stream_start
+            );
+        }
+
+        if position == self.size {
+            if let Some(segment) = self.segments.last() {
+                return format!("{}:{:#x}", segment.path.display(), segment.size);
+            }
+        }
+
+        format!("stream:{position:#x}")
+    }
+
+    fn source_at(&self, position: u64) -> Option<(&Path, u64, u64)> {
+        let segment = &self.segments[self.segment_index(position)?];
+        Some((
+            &segment.path,
+            position - segment.stream_start,
+            segment.size,
+        ))
+    }
+}
+
+impl Read for SegmentedInput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut done = 0usize;
+
+        while done < buf.len() && self.position < self.size {
+            let index = self.segment_index(self.position).ok_or_else(|| {
+                invalid(format!("no input segment at stream offset {:#x}", self.position))
+            })?;
+            let segment = &mut self.segments[index];
+            let local_offset = self.position - segment.stream_start;
+            let available = usize::try_from(segment.size - local_offset)
+                .unwrap_or(usize::MAX)
+                .min(buf.len() - done);
+
+            segment.file.seek(SeekFrom::Start(local_offset))?;
+            let count = segment.file.read(&mut buf[done..done + available])?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("unexpected EOF in {}", segment.path.display()),
+                ));
+            }
+            done += count;
+            self.position += count as u64;
+        }
+
+        Ok(done)
+    }
+}
+
+impl Seek for SegmentedInput {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let position = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+            SeekFrom::End(delta) => i128::from(self.size) + i128::from(delta),
+        };
+        if position < 0 || position > i128::from(self.size) {
+            return Err(invalid(format!("input seek outside stream: {position:#x}")));
+        }
+        self.position = position as u64;
+        Ok(self.position)
+    }
+}
+
 #[derive(Debug)]
 struct RecordHeader {
     record_size: u32,
@@ -40,15 +159,19 @@ fn checked_add(a: u64, b: u64, what: &str) -> io::Result<u64> {
         .ok_or_else(|| invalid(format!("integer overflow while computing {what}")))
 }
 
-fn read_record_header(input: &mut File, file_offset: u64) -> io::Result<RecordHeader> {
+fn read_record_header(
+    input: &mut SegmentedInput,
+    stream_offset: u64,
+) -> io::Result<RecordHeader> {
     let mut buf = [0u8; PAYLOAD_OFFSET as usize];
-    input.seek(SeekFrom::Start(file_offset))?;
+    input.seek(SeekFrom::Start(stream_offset))?;
     input.read_exact(&mut buf)?;
 
     let magic = le_u32(&buf, 0x00);
     if magic != RECORD_MAGIC {
         return Err(invalid(format!(
-            "bad record magic {magic:#010x} at file offset {file_offset:#x}"
+            "bad record magic {magic:#010x} at {}",
+            input.describe_position(stream_offset)
         )));
     }
 
@@ -392,17 +515,24 @@ fn algorithm_name(algorithm: u32) -> &'static str {
 }
 
 fn print_record_header(
-    input_path: &Path,
-    input_size: u64,
+    input: &SegmentedInput,
     record_number: u64,
-    file_offset: u64,
+    stream_offset: u64,
     record_end: u64,
-    payload_file_offset: u64,
+    payload_stream_offset: u64,
     header: &RecordHeader,
     compressed: &[u8],
 ) {
     let output_end = header.logical_offset.saturating_add(header.plain_size);
-    let payload_end = payload_file_offset.saturating_add(u64::from(header.compressed_size));
+    let payload_end = payload_stream_offset.saturating_add(u64::from(header.compressed_size));
+    let source = input.describe_position(stream_offset);
+    let record_end_location = input.describe_position(record_end);
+    let payload_start_location = input.describe_position(payload_stream_offset);
+    let payload_end_location = input.describe_position(payload_end);
+    let source_file_size = input
+        .source_at(stream_offset)
+        .map(|(_, _, size)| size)
+        .unwrap_or(0);
     let preview = compressed
         .iter()
         .take(32)
@@ -411,9 +541,12 @@ fn print_record_header(
         .join(" ");
 
     eprintln!("record {record_number} header:");
-    eprintln!("  source:              {}", input_path.display());
-    eprintln!("  source file size:    {input_size:#x} ({input_size})");
-    eprintln!("  record file range:   {file_offset:#x}..{record_end:#x}");
+    eprintln!("  source:              {source}");
+    eprintln!(
+        "  source file size:    {source_file_size:#x} ({source_file_size})"
+    );
+    eprintln!("  stream offset:       {stream_offset:#x}");
+    eprintln!("  record file range:   {source}..{record_end_location}");
     eprintln!("  magic:               {RECORD_MAGIC:#010x}");
     eprintln!(
         "  outer record size:   {:#x} ({})",
@@ -439,7 +572,9 @@ fn print_record_header(
         "  compressed size:     {:#x} ({})",
         header.compressed_size, header.compressed_size
     );
-    eprintln!("  payload file range:  {payload_file_offset:#x}..{payload_end:#x}");
+    eprintln!(
+        "  payload file range:  {payload_start_location}..{payload_end_location}"
+    );
     eprintln!("  payload first bytes: {preview}");
 
     let stored_uncompressed =
@@ -464,8 +599,10 @@ fn print_record_header(
         eprintln!("  coded symbols:       {nonzero_symbols}/{XPRESS_SYMBOLS}");
         eprintln!("  code-length counts:  {histogram}");
         eprintln!(
-            "  bitstream file start:{:#x}",
-            payload_file_offset.saturating_add(XPRESS_TABLE_BYTES as u64)
+            "  bitstream start:     {}",
+            input.describe_position(
+                payload_stream_offset.saturating_add(XPRESS_TABLE_BYTES as u64)
+            )
         );
     }
 }
@@ -504,28 +641,32 @@ fn decompress(header: &RecordHeader, compressed: &[u8]) -> io::Result<Vec<u8>> {
     }
 }
 
-fn process_file(
-    input_path: &Path,
+fn process_inputs(
+    input_names: &[String],
     output: &mut File,
     ranges: &mut BTreeMap<u64, (u64, PathBuf, u64)>,
     record_number: &mut u64,
     maximum_output_end: &mut u64,
 ) -> Result<(), Box<dyn Error>> {
-    let mut input = File::open(input_path)?;
-    let input_size = input.metadata()?.len();
-    let mut file_offset = 0u64;
+    let mut input = SegmentedInput::open(input_names)?;
+    let input_size = input.size;
+    let mut stream_offset = 0u64;
 
-    while file_offset < input_size {
-        let remaining = input_size - file_offset;
+    while stream_offset < input_size {
+        let remaining = input_size - stream_offset;
         if remaining < PAYLOAD_OFFSET {
             return Err(invalid(format!(
-                "{} has {remaining:#x} trailing bytes at {file_offset:#x}, too few for a header",
-                input_path.display()
+                "input stream has {remaining:#x} trailing bytes at {}, too few for a header",
+                input.describe_position(stream_offset)
             ))
             .into());
         }
 
-        let header = read_record_header(&mut input, file_offset)?;
+        let (input_path, file_offset, _) = input
+            .source_at(stream_offset)
+            .ok_or_else(|| invalid(format!("no source at stream offset {stream_offset:#x}")))?;
+        let input_path = input_path.to_owned();
+        let header = read_record_header(&mut input, stream_offset)?;
 
         if u64::from(header.record_size) < INNER_HEADER_SIZE {
             return Err(invalid(format!(
@@ -537,7 +678,7 @@ fn process_file(
         }
 
         let record_end = checked_add(
-            file_offset,
+            stream_offset,
             checked_add(
                 OUTER_HEADER_SIZE,
                 u64::from(header.record_size),
@@ -548,8 +689,8 @@ fn process_file(
 
         if record_end > input_size {
             return Err(invalid(format!(
-                "record at {}:{file_offset:#x} ends at {record_end:#x}, past file size {input_size:#x}",
-                input_path.display()
+                "record at {}:{file_offset:#x} ends at stream offset {record_end:#x}, past combined input size {input_size:#x}",
+                input_path.display(),
             ))
             .into());
         }
@@ -581,18 +722,18 @@ fn process_file(
 
         let payload_size = usize::try_from(header.compressed_size)
             .map_err(|_| invalid("compressed record is too large for this platform"))?;
-        let payload_file_offset = checked_add(file_offset, PAYLOAD_OFFSET, "payload offset")?;
+        let payload_stream_offset =
+            checked_add(stream_offset, PAYLOAD_OFFSET, "payload offset")?;
         let mut compressed = vec![0u8; payload_size];
-        input.seek(SeekFrom::Start(payload_file_offset))?;
+        input.seek(SeekFrom::Start(payload_stream_offset))?;
         input.read_exact(&mut compressed)?;
 
         print_record_header(
-            input_path,
-            input_size,
+            &input,
             *record_number,
-            file_offset,
+            stream_offset,
             record_end,
-            payload_file_offset,
+            payload_stream_offset,
             &header,
             &compressed,
         );
@@ -614,7 +755,7 @@ fn process_file(
             ranges,
             header.logical_offset,
             output_end,
-            input_path,
+            &input_path,
             file_offset,
         )?;
 
@@ -638,7 +779,7 @@ fn process_file(
         );
 
         *record_number += 1;
-        file_offset = record_end;
+        stream_offset = record_end;
     }
 
     Ok(())
@@ -647,7 +788,8 @@ fn process_file(
 fn usage(program: &str) {
     eprintln!("usage: {program} OUTPUT.raw INPUT.s0000000000 [INPUT.s0000000001 ...]");
     eprintln!();
-    eprintln!("Pass the s* files from one sbct.vol.pXX set in lexical order.");
+    eprintln!("Pass all split files from one sbct.vol.pXX set in physical order.");
+    eprintln!("Records may cross an input-file boundary.");
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -670,16 +812,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut maximum_output_end = 0u64;
 
     for name in &args[2..] {
-        let input_path = Path::new(name);
-        eprintln!("processing {}", input_path.display());
-        process_file(
-            input_path,
-            &mut output,
-            &mut ranges,
-            &mut record_number,
-            &mut maximum_output_end,
-        )?;
+        eprintln!("input segment {}", Path::new(name).display());
     }
+    process_inputs(
+        &args[2..],
+        &mut output,
+        &mut ranges,
+        &mut record_number,
+        &mut maximum_output_end,
+    )?;
 
     output.set_len(maximum_output_end)?;
     output.flush()?;
