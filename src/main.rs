@@ -104,14 +104,13 @@ fn check_output_range(
 
 const XPRESS_SYMBOLS: usize = 512;
 const XPRESS_TABLE_BYTES: usize = XPRESS_SYMBOLS / 2;
-const XPRESS_MAX_CODE_BITS: usize = 15;
-const XPRESS_LOOKUP_BITS: usize = XPRESS_MAX_CODE_BITS;
-const XPRESS_LOOKUP_SIZE: usize = 1 << XPRESS_LOOKUP_BITS;
+const NO_NODE: usize = usize::MAX;
 
-#[derive(Clone, Copy, Default)]
-struct HuffmanEntry {
+#[derive(Clone, Copy)]
+struct HuffmanNode {
+    children: [usize; 2],
+    is_leaf: bool,
     symbol: u16,
-    length: u8,
 }
 
 struct XpressBitStream<'a> {
@@ -165,78 +164,100 @@ impl<'a> XpressBitStream<'a> {
     }
 }
 
-fn build_xpress_table(compressed: &[u8]) -> io::Result<Vec<HuffmanEntry>> {
+fn add_huffman_leaf(
+    nodes: &mut [HuffmanNode],
+    leaf_index: usize,
+    code: u32,
+    mut bits: u32,
+) -> Option<usize> {
+    let mut current = 0usize;
+    let mut next_free = leaf_index + 1;
+
+    while bits > 1 {
+        bits -= 1;
+        let child = usize::try_from((code >> bits) & 1).ok()?;
+        if nodes.get(current)?.children[child] == NO_NODE {
+            nodes.get_mut(next_free)?.is_leaf = false;
+            nodes.get_mut(current)?.children[child] = next_free;
+            next_free += 1;
+        }
+        current = nodes.get(current)?.children[child];
+    }
+
+    let child = usize::try_from(code & 1).ok()?;
+    nodes.get_mut(current)?.children[child] = leaf_index;
+    Some(next_free)
+}
+
+fn build_xpress_tree(compressed: &[u8]) -> io::Result<Vec<HuffmanNode>> {
     if compressed.len() < XPRESS_TABLE_BYTES {
         return Err(invalid("truncated XPRESS-Huffman code-length table"));
     }
 
-    let mut lengths = [0u8; XPRESS_SYMBOLS];
+    let mut symbols = Vec::with_capacity(XPRESS_SYMBOLS);
     for (index, byte) in compressed[..XPRESS_TABLE_BYTES].iter().copied().enumerate() {
-        lengths[index * 2] = byte & 0x0f;
-        lengths[index * 2 + 1] = byte >> 4;
+        symbols.push((byte & 0x0f, u16::try_from(index * 2).unwrap()));
+        symbols.push((byte >> 4, u16::try_from(index * 2 + 1).unwrap()));
     }
+    symbols.sort_unstable();
 
-    let mut counts = [0u32; XPRESS_MAX_CODE_BITS + 1];
-    for length in lengths {
-        if usize::from(length) > XPRESS_MAX_CODE_BITS {
-            return Err(invalid("XPRESS-Huffman code length exceeds 15 bits"));
-        }
-        if length != 0 {
-            counts[usize::from(length)] += 1;
-        }
-    }
-
-    // Canonical Huffman-code construction.  A negative number of remaining
-    // leaves means the supplied lengths over-subscribe the tree.
-    let mut remaining = 1i32;
-    for &count in &counts[1..] {
-        remaining = remaining
-            .checked_mul(2)
-            .and_then(|value| value.checked_sub(i32::try_from(count).ok()?))
-            .ok_or_else(|| invalid("invalid XPRESS-Huffman code lengths"))?;
-        if remaining < 0 {
-            return Err(invalid("over-subscribed XPRESS-Huffman tree"));
-        }
-    }
-
-    let mut next_code = [0u32; XPRESS_MAX_CODE_BITS + 1];
+    let empty = HuffmanNode {
+        children: [NO_NODE, NO_NODE],
+        is_leaf: false,
+        symbol: 0,
+    };
+    let mut nodes = vec![empty; 1024];
+    let first_used = symbols.iter().take_while(|(length, _)| *length == 0).count();
     let mut code = 0u32;
-    for length in 1..=XPRESS_MAX_CODE_BITS {
-        code = (code + counts[length - 1]) << 1;
-        next_code[length] = code;
-    }
+    let mut previous_length = 1u32;
+    let mut leaf_index = 1usize;
 
-    let mut table = vec![HuffmanEntry::default(); XPRESS_LOOKUP_SIZE];
-    for (symbol, &length) in lengths.iter().enumerate() {
-        if length == 0 {
-            continue;
+    for &(length, symbol) in &symbols[first_used..] {
+        let length = u32::from(length);
+        if length == 0 || length > 15 {
+            return Err(invalid("invalid XPRESS-Huffman code length"));
         }
 
-        let length_usize = usize::from(length);
-        let code = next_code[length_usize];
-        next_code[length_usize] += 1;
+        let leaf = nodes
+            .get_mut(leaf_index)
+            .ok_or_else(|| invalid("over-subscribed XPRESS-Huffman tree"))?;
+        leaf.symbol = symbol;
+        leaf.is_leaf = true;
 
-        let suffix_bits = XPRESS_LOOKUP_BITS - length_usize;
-        let first = usize::try_from(code)
-            .map_err(|_| invalid("XPRESS-Huffman code does not fit usize"))?
-            << suffix_bits;
-        let last = first + (1usize << suffix_bits);
-        if last > table.len() {
-            return Err(invalid("XPRESS-Huffman code exceeds lookup table"));
-        }
-
-        let entry = HuffmanEntry {
-            symbol: u16::try_from(symbol).unwrap(),
-            length,
-        };
-        table[first..last].fill(entry);
+        code = code.wrapping_shl(length - previous_length);
+        previous_length = length;
+        leaf_index = add_huffman_leaf(&mut nodes, leaf_index, code, length)
+            .ok_or_else(|| invalid("over-subscribed XPRESS-Huffman tree"))?;
+        code = code.wrapping_add(1);
     }
 
-    Ok(table)
+    Ok(nodes)
+}
+
+fn decode_xpress_symbol(
+    stream: &mut XpressBitStream<'_>,
+    nodes: &[HuffmanNode],
+) -> io::Result<u16> {
+    let mut node_index = 0usize;
+    loop {
+        let node = nodes
+            .get(node_index)
+            .ok_or_else(|| invalid("XPRESS-Huffman tree index out of range"))?;
+        if node.is_leaf {
+            return Ok(node.symbol);
+        }
+
+        let bit = usize::try_from(stream.peek(1)).unwrap();
+        stream.consume(1);
+        node_index = node.children[bit];
+        if node_index == NO_NODE {
+            return Err(invalid("invalid or truncated XPRESS-Huffman bitstream"));
+        }
+    }
 }
 
 fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Result<Vec<u8>> {
-    let table = build_xpress_table(compressed)?;
+    let tree = build_xpress_tree(compressed)?;
     let bitstream_data = compressed
         .get(XPRESS_TABLE_BYTES..)
         .ok_or_else(|| invalid("truncated XPRESS-Huffman stream"))?;
@@ -246,19 +267,14 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
     // SBCT records use one Huffman table for the entire compressed record.
     // In particular, there is no new table at each 64 KiB output boundary.
     while output.len() < output_size {
-        let lookup = usize::try_from(stream.peek(XPRESS_LOOKUP_BITS as u32)).unwrap();
-        let entry = table[lookup];
-        if entry.length == 0 {
-            return Err(invalid("invalid or truncated XPRESS-Huffman bitstream"));
-        }
-        stream.consume(u32::from(entry.length));
+        let symbol = decode_xpress_symbol(&mut stream, &tree)?;
 
-        if entry.symbol < 256 {
-            output.push(entry.symbol as u8);
+        if symbol < 256 {
+            output.push(symbol as u8);
             continue;
         }
 
-        let match_symbol = u32::from(entry.symbol) - 256;
+        let match_symbol = u32::from(symbol) - 256;
         let offset_bits = match_symbol >> 4;
         let match_offset = (1usize << offset_bits)
             | usize::try_from(stream.peek(offset_bits)).unwrap();
