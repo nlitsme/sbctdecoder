@@ -102,6 +102,202 @@ fn check_output_range(
     Ok(())
 }
 
+const XPRESS_SYMBOLS: usize = 512;
+const XPRESS_TABLE_BYTES: usize = XPRESS_SYMBOLS / 2;
+const XPRESS_MAX_CODE_BITS: usize = 15;
+const XPRESS_LOOKUP_BITS: usize = XPRESS_MAX_CODE_BITS;
+const XPRESS_LOOKUP_SIZE: usize = 1 << XPRESS_LOOKUP_BITS;
+
+#[derive(Clone, Copy, Default)]
+struct HuffmanEntry {
+    symbol: u16,
+    length: u8,
+}
+
+struct XpressBitStream<'a> {
+    data: &'a [u8],
+    position: usize,
+    bits: u32,
+    available: u32,
+}
+
+impl<'a> XpressBitStream<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let mut stream = Self {
+            data,
+            position: 0,
+            bits: 0,
+            available: 0,
+        };
+        stream.bits = (stream.read_u16() << 16) | stream.read_u16();
+        stream.available = 32;
+        stream
+    }
+
+    fn read_u16(&mut self) -> u32 {
+        let lo = self.data.get(self.position).copied().unwrap_or(0);
+        let hi = self.data.get(self.position + 1).copied().unwrap_or(0);
+        self.position = self.position.saturating_add(2);
+        u32::from(lo) | (u32::from(hi) << 8)
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        let byte = self.data.get(self.position).copied().unwrap_or(0);
+        self.position = self.position.saturating_add(1);
+        byte
+    }
+
+    fn peek(&self, count: u32) -> u32 {
+        if count == 0 {
+            0
+        } else {
+            self.bits >> (32 - count)
+        }
+    }
+
+    fn consume(&mut self, count: u32) {
+        self.bits = self.bits.wrapping_shl(count);
+        self.available -= count;
+        if self.available < 16 {
+            self.bits |= self.read_u16() << (16 - self.available);
+            self.available += 16;
+        }
+    }
+}
+
+fn build_xpress_table(compressed: &[u8]) -> io::Result<Vec<HuffmanEntry>> {
+    if compressed.len() < XPRESS_TABLE_BYTES {
+        return Err(invalid("truncated XPRESS-Huffman code-length table"));
+    }
+
+    let mut lengths = [0u8; XPRESS_SYMBOLS];
+    for (index, byte) in compressed[..XPRESS_TABLE_BYTES].iter().copied().enumerate() {
+        lengths[index * 2] = byte & 0x0f;
+        lengths[index * 2 + 1] = byte >> 4;
+    }
+
+    let mut counts = [0u32; XPRESS_MAX_CODE_BITS + 1];
+    for length in lengths {
+        if usize::from(length) > XPRESS_MAX_CODE_BITS {
+            return Err(invalid("XPRESS-Huffman code length exceeds 15 bits"));
+        }
+        if length != 0 {
+            counts[usize::from(length)] += 1;
+        }
+    }
+
+    // Canonical Huffman-code construction.  A negative number of remaining
+    // leaves means the supplied lengths over-subscribe the tree.
+    let mut remaining = 1i32;
+    for &count in &counts[1..] {
+        remaining = remaining
+            .checked_mul(2)
+            .and_then(|value| value.checked_sub(i32::try_from(count).ok()?))
+            .ok_or_else(|| invalid("invalid XPRESS-Huffman code lengths"))?;
+        if remaining < 0 {
+            return Err(invalid("over-subscribed XPRESS-Huffman tree"));
+        }
+    }
+
+    let mut next_code = [0u32; XPRESS_MAX_CODE_BITS + 1];
+    let mut code = 0u32;
+    for length in 1..=XPRESS_MAX_CODE_BITS {
+        code = (code + counts[length - 1]) << 1;
+        next_code[length] = code;
+    }
+
+    let mut table = vec![HuffmanEntry::default(); XPRESS_LOOKUP_SIZE];
+    for (symbol, &length) in lengths.iter().enumerate() {
+        if length == 0 {
+            continue;
+        }
+
+        let length_usize = usize::from(length);
+        let code = next_code[length_usize];
+        next_code[length_usize] += 1;
+
+        let suffix_bits = XPRESS_LOOKUP_BITS - length_usize;
+        let first = usize::try_from(code)
+            .map_err(|_| invalid("XPRESS-Huffman code does not fit usize"))?
+            << suffix_bits;
+        let last = first + (1usize << suffix_bits);
+        if last > table.len() {
+            return Err(invalid("XPRESS-Huffman code exceeds lookup table"));
+        }
+
+        let entry = HuffmanEntry {
+            symbol: u16::try_from(symbol).unwrap(),
+            length,
+        };
+        table[first..last].fill(entry);
+    }
+
+    Ok(table)
+}
+
+fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Result<Vec<u8>> {
+    let table = build_xpress_table(compressed)?;
+    let bitstream_data = compressed
+        .get(XPRESS_TABLE_BYTES..)
+        .ok_or_else(|| invalid("truncated XPRESS-Huffman stream"))?;
+    let mut stream = XpressBitStream::new(bitstream_data);
+    let mut output = Vec::with_capacity(output_size);
+
+    // SBCT records use one Huffman table for the entire compressed record.
+    // In particular, there is no new table at each 64 KiB output boundary.
+    while output.len() < output_size {
+        let lookup = usize::try_from(stream.peek(XPRESS_LOOKUP_BITS as u32)).unwrap();
+        let entry = table[lookup];
+        if entry.length == 0 {
+            return Err(invalid("invalid or truncated XPRESS-Huffman bitstream"));
+        }
+        stream.consume(u32::from(entry.length));
+
+        if entry.symbol < 256 {
+            output.push(entry.symbol as u8);
+            continue;
+        }
+
+        let match_symbol = u32::from(entry.symbol) - 256;
+        let offset_bits = match_symbol >> 4;
+        let match_offset = (1usize << offset_bits)
+            | usize::try_from(stream.peek(offset_bits)).unwrap();
+        stream.consume(offset_bits);
+
+        let length_header = match_symbol & 0x0f;
+        let mut match_length = length_header;
+        if length_header == 0x0f {
+            match_length = u32::from(stream.read_byte()) + 0x0f;
+            if match_length == 0x10e {
+                let lo = u32::from(stream.read_byte());
+                let hi = u32::from(stream.read_byte());
+                match_length = lo | (hi << 8);
+            }
+        }
+        match_length += 3;
+        let match_length = usize::try_from(match_length).unwrap();
+
+        if match_offset == 0 || match_offset > output.len() {
+            return Err(invalid(format!(
+                "XPRESS-Huffman match offset {match_offset:#x} precedes output"
+            )));
+        }
+        if match_length > output_size - output.len() {
+            return Err(invalid(format!(
+                "XPRESS-Huffman match overruns output by {:#x} bytes",
+                match_length - (output_size - output.len())
+            )));
+        }
+
+        for _ in 0..match_length {
+            let byte = output[output.len() - match_offset];
+            output.push(byte);
+        }
+    }
+
+    Ok(output)
+}
+
 fn decompress(header: &RecordHeader, compressed: &[u8]) -> io::Result<Vec<u8>> {
     let expected_size = usize::try_from(header.plain_size)
         .map_err(|_| invalid("uncompressed record is too large for this platform"))?;
@@ -120,11 +316,7 @@ fn decompress(header: &RecordHeader, compressed: &[u8]) -> io::Result<Vec<u8>> {
         }
 
         // Windows CompressAlgorithm::XpressHuff.
-        4 => xpress_huffman::decompress(compressed, expected_size).map_err(|error| {
-            invalid(format!(
-                "XPRESS-Huffman decompression failed: {error:?}"
-            ))
-        }),
+        4 => decompress_xpress_huffman(compressed, expected_size),
 
         algorithm => Err(invalid(format!(
             "unsupported compression algorithm {algorithm}"
