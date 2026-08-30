@@ -455,24 +455,19 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
                     bitstream_position.saturating_add(stream.position)
                 )));
             }
-            let match_end = output
-                .len()
-                .checked_add(match_length)
-                .ok_or_else(|| invalid("XPRESS-Huffman match output overflow"))?;
-            let copy_length = match_length.min(output_size - output.len());
-            if match_end > output_size {
+            let remaining_in_block = block_output_limit - output.len();
+            let copy_length = match_length.min(remaining_in_block);
+            if copy_length != match_length {
                 eprintln!(
-                    "    XPRESS record-final match: clipping {match_length:#x} to \
-                     {copy_length:#x} bytes at output {:#x} ({:#x} byte padding overrun)",
-                    output.len(),
-                    match_end - output_size
+                    "    XPRESS block {block_number:4}: clipping block-final match from \
+                     {match_length:#x} to {copy_length:#x} bytes at output {:#x}",
+                    output.len()
                 );
             }
 
-            // A match may cross the nominal 64 KiB block end.  MS-XCA tests
-            // that boundary only before decoding the next symbol.  Preserve
-            // such internal crossings, but discard encoder padding beyond the
-            // SBCT record's explicitly declared output size.
+            // Each SBCT XPRESS chunk represents at most 64 KiB.  A final match
+            // can describe padding beyond that boundary; discard the padding
+            // before beginning the next Huffman table.
             for _ in 0..copy_length {
                 let byte = output[output.len() - match_offset];
                 output.push(byte);
@@ -498,12 +493,13 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
     }
 
     if output.len() < output_size {
-        return Err(invalid(format!(
-            "XPRESS-Huffman payload ended after producing {:#x} of {output_size:#x} bytes",
-            output.len()
-        )));
-    }
-    if compressed_position != compressed.len() {
+        eprintln!(
+            "    XPRESS partial record: decoded {:#x} of {output_size:#x} bytes; \
+             {:#x} bytes are represented sparsely",
+            output.len(),
+            output_size - output.len()
+        );
+    } else if compressed_position != compressed.len() {
         eprintln!(
             "    XPRESS trailing payload: {:#x} bytes at {compressed_position:#x}..{:#x}",
             compressed.len() - compressed_position,
@@ -767,7 +763,29 @@ fn process_inputs(
             file_offset,
         )?;
 
-        output.seek(SeekFrom::Start(header.logical_offset))?;
+        let decoded_size = u64::try_from(plain.len())
+            .map_err(|_| invalid("decoded record is too large for this platform"))?;
+        let sparse_size = header.plain_size - decoded_size;
+        let data_output_offset = if sparse_size == 0 || header.logical_offset == 0 {
+            if sparse_size != 0 {
+                eprintln!(
+                    "    SBCT sparse suffix: output {:#x}..{output_end:#x} \
+                     ({sparse_size:#x} zero bytes)",
+                    header.logical_offset + decoded_size
+                );
+            }
+            header.logical_offset
+        } else {
+            let data_offset = header.logical_offset + sparse_size;
+            eprintln!(
+                "    SBCT sparse prefix: output {:#x}..{data_offset:#x} \
+                 ({sparse_size:#x} zero bytes); decoded data starts at {data_offset:#x}",
+                header.logical_offset
+            );
+            data_offset
+        };
+
+        output.seek(SeekFrom::Start(data_output_offset))?;
         output.write_all(&plain)?;
         *maximum_output_end = (*maximum_output_end).max(output_end);
 
