@@ -253,36 +253,41 @@ struct XpressBitStream<'a> {
 }
 
 impl<'a> XpressBitStream<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn new(data: &'a [u8]) -> io::Result<Self> {
         let mut stream = Self {
             data,
             position: 0,
             bits: 0,
             available: 0,
         };
-        stream.bits = (stream.read_u16() << 16) | stream.read_u16();
+        stream.bits = (stream.read_u16()? << 16) | stream.read_u16()?;
         stream.available = 32;
-        stream
+        Ok(stream)
     }
 
-    fn read_u16(&mut self) -> u32 {
-        let available = self.data.len().saturating_sub(self.position);
-        let value = match available {
-            0 => 0,
-            1 => u32::from(self.data[self.position]) << 8,
-            _ => u32::from(u16::from_le_bytes([
-                self.data[self.position],
-                self.data[self.position + 1],
-            ])),
-        };
-        self.position += available.min(2);
-        value
+    fn read_raw<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        let end = self.position.checked_add(N)
+            .ok_or_else(|| invalid("XPRESS raw-read offset overflow"))?;
+        let bytes = self.data.get(self.position..end).ok_or_else(|| {
+            invalid(format!(
+                "truncated XPRESS raw read: need {N} bytes at bitstream offset {:#x}",
+                self.position
+            ))
+        })?;
+        self.position = end;
+        Ok(bytes.try_into().unwrap())
     }
 
-    fn read_byte(&mut self) -> u8 {
-        let byte = self.data.get(self.position).copied().unwrap_or(0);
-        self.position = self.position.saturating_add(1);
-        byte
+    fn read_u16(&mut self) -> io::Result<u32> {
+        Ok(u32::from(u16::from_le_bytes(self.read_raw()?)))
+    }
+
+    fn read_u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(self.read_raw()?))
+    }
+
+    fn read_byte(&mut self) -> io::Result<u8> {
+        Ok(self.read_raw::<1>()?[0])
     }
 
     fn peek(&self, count: u32) -> u32 {
@@ -293,14 +298,41 @@ impl<'a> XpressBitStream<'a> {
         }
     }
 
-    fn consume(&mut self, count: u32) {
+    fn consume(&mut self, count: u32) -> io::Result<()> {
         self.bits = self.bits.wrapping_shl(count);
         self.available -= count;
         if self.available < 16 {
-            self.bits |= self.read_u16() << (16 - self.available);
+            self.bits |= self.read_u16()? << (16 - self.available);
             self.available += 16;
         }
+        Ok(())
     }
+}
+
+fn read_xpress_match_length(
+    stream: &mut XpressBitStream<'_>,
+    length_header: u32,
+) -> io::Result<usize> {
+    // MS-XCA 2.1.4.3: FF + 0000 introduces a raw little-endian u32.
+    // All extended-length bytes precede consumption/refill of offset bits.
+    let mut length = u64::from(length_header);
+    if length_header == 15 {
+        let extension = stream.read_byte()?;
+        if extension == 255 {
+            length = u64::from(stream.read_u16()?);
+            if length == 0 {
+                length = u64::from(stream.read_u32()?);
+            }
+            if length < 15 {
+                return Err(invalid("invalid XPRESS extended match length (<15)"));
+            }
+        } else {
+            length = 15 + u64::from(extension);
+        }
+    }
+    // Widen before adding the minimum match length, so u32::MAX cannot wrap.
+    usize::try_from(length + 3)
+        .map_err(|_| invalid("XPRESS match length is too large for this platform"))
 }
 
 fn add_huffman_leaf(
@@ -337,6 +369,15 @@ fn build_xpress_tree(compressed: &[u8]) -> io::Result<Vec<HuffmanNode>> {
     for (index, byte) in compressed[..XPRESS_TABLE_BYTES].iter().copied().enumerate() {
         symbols.push((byte & 0x0f, u16::try_from(index * 2).unwrap()));
         symbols.push((byte >> 4, u16::try_from(index * 2 + 1).unwrap()));
+    }
+    let coverage: u32 = symbols.iter()
+        .filter(|(length, _)| *length != 0)
+        .map(|(length, _)| 1u32 << (15 - u32::from(*length)))
+        .sum();
+    if coverage != 1 << 15 {
+        return Err(invalid(format!(
+            "invalid XPRESS-Huffman table: code-space coverage {coverage}/32768"
+        )));
     }
     symbols.sort_unstable();
 
@@ -387,7 +428,7 @@ fn decode_xpress_symbol(
         }
 
         let bit = usize::try_from(stream.peek(1)).unwrap();
-        stream.consume(1);
+        stream.consume(1)?;
         node_index = node.children[bit];
         if node_index == NO_NODE {
             return Err(invalid("invalid or truncated XPRESS-Huffman bitstream"));
@@ -412,7 +453,9 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
                      {compressed_position:#x}"
                 ))
             })?;
-        let tree = build_xpress_tree(table)?;
+        let tree = build_xpress_tree(table).map_err(|error| invalid(format!(
+            "block {block_number}, table at payload {compressed_position:#x}: {error}"
+        )))?;
         let table_position = compressed_position;
         compressed_position = table_end;
 
@@ -421,7 +464,7 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
             .saturating_add(XPRESS_BLOCK_SIZE)
             .min(output_size);
         let bitstream_position = compressed_position;
-        let mut stream = XpressBitStream::new(&compressed[bitstream_position..]);
+        let mut stream = XpressBitStream::new(&compressed[bitstream_position..])?;
 
         while output.len() < block_output_limit {
             let symbol = decode_xpress_symbol(&mut stream, &tree)?;
@@ -436,21 +479,17 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
             let match_offset = (1usize << offset_bits)
                 | usize::try_from(stream.peek(offset_bits)).unwrap();
 
-            // The extended match length is a raw byte (or word) interleaved at
+            // The extended match length is a raw byte, word, or dword interleaved at
             // the compressed-byte cursor.  Read it before consuming the offset
             // bits: consuming those bits may refill the bit buffer and advance
             // that cursor.
             let length_header = match_symbol & 0x0f;
-            let mut match_length = length_header;
-            if length_header == 0x0f {
-                match_length = u32::from(stream.read_byte()) + 0x0f;
-                if match_length == 0x10e {
-                    match_length = stream.read_u16();
-                }
-            }
-            match_length += 3;
-            let match_length = usize::try_from(match_length).unwrap();
-            stream.consume(offset_bits);
+            let match_length = read_xpress_match_length(&mut stream, length_header)
+                .map_err(|error| invalid(format!(
+                    "block {block_number}, output {:#x}, payload cursor {:#x}: {error}",
+                    output.len(), bitstream_position + stream.position
+                )))?;
+            stream.consume(offset_bits)?;
 
             if match_offset == 0 || match_offset > output.len() {
                 return Err(invalid(format!(
@@ -463,20 +502,17 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
                     bitstream_position.saturating_add(stream.position)
                 )));
             }
-            let remaining_in_block = block_output_limit - output.len();
-            let copy_length = match_length.min(remaining_in_block);
-            if copy_length != match_length {
-                eprintln!(
-                    "    XPRESS block {block_number:4}: clipping block-final match from \
-                     {match_length:#x} to {copy_length:#x} bytes at output {:#x}",
+            if match_length > output_size - output.len() {
+                return Err(invalid(format!(
+                    "XPRESS-Huffman match in block {block_number} exceeds declared record \
+                     output: position {:#x}, length {match_length:#x}, limit {output_size:#x}",
                     output.len()
-                );
+                )));
             }
 
-            // Each SBCT XPRESS chunk represents at most 64 KiB.  A final match
-            // can describe padding beyond that boundary; discard the padding
-            // before beginning the next Huffman table.
-            for _ in 0..copy_length {
+            // 64 KiB is a block-ending threshold, not a match-copy limit.
+            // Finish the entire match before beginning the next Huffman table.
+            for _ in 0..match_length {
                 let byte = output[output.len() - match_offset];
                 output.push(byte);
             }
@@ -502,8 +538,8 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
 
     if output.len() < output_size {
         eprintln!(
-            "    XPRESS partial record: decoded {:#x} of {output_size:#x} bytes; \
-             {:#x} bytes are represented sparsely",
+            "    WARNING: short XPRESS output: decoded {:#x} of {output_size:#x} bytes; \
+             zero-filling the {:#x}-byte suffix is an unverified assumption",
             output.len(),
             output_size - output.len()
         );
@@ -835,4 +871,94 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn abc_vector() -> Vec<u8> {
+        // MS-XCA 3.2: three literals followed by a distance-3 length-297 match.
+        let mut data = vec![0u8; XPRESS_TABLE_BYTES];
+        data[48] = 0x30;
+        data[49] = 0x23;
+        data[128] = 0x02;
+        data[143] = 0x20;
+        data.extend_from_slice(&[0xa8, 0xdc, 0, 0, 0xff, 0x26, 0x01]);
+        data
+    }
+
+    fn long_run(size: u32) -> Vec<u8> {
+        // Two one-bit codes: literal A (0), distance-1 extended match (1).
+        // The first literal accounts for one byte; the encoded length omits 3.
+        assert!(size >= 0x10004);
+        let mut data = vec![0u8; XPRESS_TABLE_BYTES];
+        data[32] = 0x10;
+        data[135] = 0x10;
+        data.extend_from_slice(&[0, 0x40, 0, 0, 0xff, 0, 0]);
+        data.extend_from_slice(&(size - 4).to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn public_abc_example() {
+        assert_eq!(decompress_xpress_huffman(&abc_vector(), 300).unwrap(),
+                   b"abc".repeat(100));
+    }
+
+    #[test]
+    fn long_match_is_not_clipped() {
+        let data = long_run(0x20000);
+        assert_eq!(decompress_xpress_huffman(&data, 0x20000).unwrap(),
+                   vec![b'A'; 0x20000]);
+    }
+
+    #[test]
+    fn next_table_follows_the_complete_long_match() {
+        let mut data = long_run(0x20000);
+        data.extend(abc_vector());
+        let mut expected = vec![b'A'; 0x20000];
+        expected.extend(b"abc".repeat(100));
+        assert_eq!(decompress_xpress_huffman(&data, expected.len()).unwrap(), expected);
+    }
+
+    #[test]
+    fn truncated_dword_is_rejected() {
+        let data = long_run(0x20000);
+        for cut in 1..=4 {
+            assert!(decompress_xpress_huffman(&data[..data.len() - cut], 0x20000).is_err());
+        }
+    }
+
+    #[test]
+    fn overrun_and_invalid_extended_lengths_are_rejected() {
+        let data = long_run(0x20000);
+        assert!(decompress_xpress_huffman(&data, 0x1ffff).is_err());
+        for length in [0u32, 1, 14, u32::MAX] {
+            let mut invalid_data = data[..data.len() - 4].to_vec();
+            invalid_data.extend_from_slice(&length.to_le_bytes());
+            assert!(decompress_xpress_huffman(&invalid_data, 0x20000).is_err());
+        }
+    }
+
+    #[test]
+    fn extended_length_is_read_before_offset_refill() {
+        let data = [0xff, 0, 0, 0, 0, 1, 0, 0x34, 0x12];
+        let mut stream = XpressBitStream {
+            data: &data, position: 0, bits: 0, available: 16,
+        };
+        assert_eq!(read_xpress_match_length(&mut stream, 15).unwrap(), 0x10003);
+        assert_eq!(stream.position, 7);
+        stream.consume(15).unwrap();
+        assert_eq!(stream.position, 9);
+        assert_eq!(stream.available, 17);
+        assert_eq!(stream.bits, 0x1234 << 15);
+    }
+
+    #[test]
+    fn invalid_tables_and_short_lookahead_are_rejected() {
+        assert!(build_xpress_tree(&[0; 256]).is_err());
+        assert!(build_xpress_tree(&[0x11; 256]).is_err());
+        assert!(XpressBitStream::new(&[0, 0, 0]).is_err());
+    }
 }
