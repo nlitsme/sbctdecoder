@@ -374,7 +374,11 @@ fn build_xpress_tree(compressed: &[u8]) -> io::Result<Vec<HuffmanNode>> {
         .filter(|(length, _)| *length != 0)
         .map(|(length, _)| 1u32 << (15 - u32::from(*length)))
         .sum();
-    if coverage != 1 << 15 {
+    // Observed SBCT singleton variant: only canonical code 0 is assigned.
+    // Leave code 1 absent; do not accept arbitrary incomplete trees.
+    let singleton = symbols.iter().filter(|(length, _)| *length != 0).count() == 1
+        && symbols.iter().any(|(length, _)| *length == 1);
+    if coverage != 1 << 15 && !singleton {
         return Err(invalid(format!(
             "invalid XPRESS-Huffman table: code-space coverage {coverage}/32768"
         )));
@@ -956,9 +960,36 @@ mod tests {
     }
 
     #[test]
+    fn singleton_literal_and_unused_branch() {
+        let mut data = vec![0u8; XPRESS_TABLE_BYTES];
+        data[32] = 0x10; // Literal A, canonical code 0.
+        data.extend_from_slice(&[0; 4]);
+        assert_eq!(decompress_xpress_huffman(&data, 8).unwrap(), vec![b'A'; 8]);
+        data[XPRESS_TABLE_BYTES + 1] = 0x80; // First code bit is 1.
+        assert!(decompress_xpress_huffman(&data, 8).is_err());
+    }
+
+    #[test]
+    fn singleton_match_uses_previous_block_history() {
+        let mut block = vec![0u8; XPRESS_TABLE_BYTES];
+        block[135] = 0x10; // Distance-1 match with extended length, code 0.
+        block.extend_from_slice(&[0, 0, 0, 0, 0xff, 0xfd, 0xff]);
+        assert!(decompress_xpress_huffman(&block, 0x10000).is_err());
+        let mut data = long_run(0x20000);
+        data.extend(block);
+        assert_eq!(decompress_xpress_huffman(&data, 0x30000).unwrap(),
+                   vec![b'A'; 0x30000]);
+    }
+
+    #[test]
     fn invalid_tables_and_short_lookahead_are_rejected() {
         assert!(build_xpress_tree(&[0; 256]).is_err());
         assert!(build_xpress_tree(&[0x11; 256]).is_err());
+        let mut incomplete = [0u8; 256];
+        incomplete[32] = 0x20; // Singleton with a two-bit code is not allowed.
+        assert!(build_xpress_tree(&incomplete).is_err());
+        incomplete[33] = 0x20; // Nor two two-bit codes.
+        assert!(build_xpress_tree(&incomplete).is_err());
         assert!(XpressBitStream::new(&[0, 0, 0]).is_err());
     }
 }
