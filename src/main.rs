@@ -132,11 +132,13 @@ impl Seek for SegmentedInput {
 #[derive(Debug)]
 struct RecordHeader {
     record_size: u32,
-    index: u32,
-    algorithm: u32,
+    unk0: u32,
+    unk1: u32,
     plain_size: u64,
     logical_offset: u64,
-    tag: u64,
+    magic2: u32,
+    inner_header_size: u16,
+    flags: u16,
     inner_size_1: u64,
     inner_size_2: u64,
     compressed_size: u32,
@@ -144,6 +146,10 @@ struct RecordHeader {
 
 fn le_u32(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+}
+
+fn le_u16(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap())
 }
 
 fn le_u64(buf: &[u8], offset: usize) -> u64 {
@@ -177,11 +183,13 @@ fn read_record_header(
 
     Ok(RecordHeader {
         record_size: le_u32(&buf, 0x04),
-        index: le_u32(&buf, 0x08),
-        algorithm: le_u32(&buf, 0x0c),
+        unk0: le_u32(&buf, 0x08),
+        unk1: le_u32(&buf, 0x0c),
         plain_size: le_u64(&buf, 0x10),
         logical_offset: le_u64(&buf, 0x18),
-        tag: le_u64(&buf, 0x20),
+        magic2: le_u32(&buf, 0x20),
+        inner_header_size: le_u16(&buf, 0x24),
+        flags: le_u16(&buf, 0x26),
         inner_size_1: le_u64(&buf, 0x28),
         inner_size_2: le_u64(&buf, 0x30),
         compressed_size: le_u32(&buf, 0x38),
@@ -510,14 +518,6 @@ fn decompress_xpress_huffman(compressed: &[u8], output_size: usize) -> io::Resul
     Ok(output)
 }
 
-fn algorithm_name(algorithm: u32) -> &'static str {
-    match algorithm {
-        1 => "uncompressed",
-        4 => "XPRESS-Huffman",
-        _ => "unknown",
-    }
-}
-
 fn print_record_header(
     input: &SegmentedInput,
     record_number: u64,
@@ -556,20 +556,20 @@ fn print_record_header(
         "  outer record size:   {:#x} ({})",
         header.record_size, header.record_size
     );
-    eprintln!("  record index:        {:#x} ({})", header.index, header.index);
-    eprintln!(
-        "  algorithm:           {:#x} ({}, {})",
-        header.algorithm,
-        header.algorithm,
-        algorithm_name(header.algorithm)
-    );
+    eprintln!("  unknown +0x08:       {:#x} ({})", header.unk0, header.unk0);
+    eprintln!("  unknown +0x0c:       {:#x} ({})", header.unk1, header.unk1);
     eprintln!(
         "  plain size:          {:#x} ({})",
         header.plain_size, header.plain_size
     );
     eprintln!("  logical offset:      {:#x}", header.logical_offset);
     eprintln!("  logical output end:  {output_end:#x}");
-    eprintln!("  tag/checksum:        {:#018x}", header.tag);
+    eprintln!("  magic2:              {:#010x}", header.magic2);
+    eprintln!(
+        "  inner header size:   {:#x} ({})",
+        header.inner_header_size, header.inner_header_size
+    );
+    eprintln!("  flags:               {:#06x}", header.flags);
     eprintln!("  inner plain size 1:  {:#x}", header.inner_size_1);
     eprintln!("  inner plain size 2:  {:#x}", header.inner_size_2);
     eprintln!(
@@ -584,9 +584,9 @@ fn print_record_header(
     let stored_uncompressed =
         usize::try_from(header.plain_size).ok() == Some(compressed.len());
 
-    if header.algorithm == 4 && stored_uncompressed {
+    if header.unk1 == 4 && stored_uncompressed {
         eprintln!("  storage mode:         raw fallback (stored size equals plain size)");
-    } else if header.algorithm == 4 && compressed.len() >= XPRESS_TABLE_BYTES {
+    } else if header.unk1 == 4 && compressed.len() >= XPRESS_TABLE_BYTES {
         let mut histogram = [0usize; 16];
         for byte in &compressed[..XPRESS_TABLE_BYTES] {
             histogram[usize::from(byte & 0x0f)] += 1;
@@ -615,22 +615,10 @@ fn decompress(header: &RecordHeader, compressed: &[u8]) -> io::Result<Vec<u8>> {
     let expected_size = usize::try_from(header.plain_size)
         .map_err(|_| invalid("uncompressed record is too large for this platform"))?;
 
-    match header.algorithm {
-        // Windows CompressAlgorithm::NullAlgorithm.
-        1 => {
-            if compressed.len() != expected_size {
-                return Err(invalid(format!(
-                    "uncompressed record has {:#x} payload bytes, expected {:#x}",
-                    compressed.len(),
-                    expected_size
-                )));
-            }
-            Ok(compressed.to_vec())
-        }
-
-        // Windows CompressAlgorithm::XpressHuff. SBCT retains algorithm 4 in
-        // the header when compression is not beneficial, but stores such a
-        // record verbatim. Equal stored/plain sizes identify that fallback.
+    match header.unk1 {
+        // All observed records contain 4 at +0x0c. Their payload is either
+        // XPRESS-Huffman data or, when stored and plain sizes are equal, the
+        // literal bytes. The field's actual name and enum are not established.
         4 if compressed.len() == expected_size => {
             eprintln!(
                 "    payload stored uncompressed: {expected_size:#x} bytes"
@@ -639,8 +627,8 @@ fn decompress(header: &RecordHeader, compressed: &[u8]) -> io::Result<Vec<u8>> {
         }
         4 => decompress_xpress_huffman(compressed, expected_size),
 
-        algorithm => Err(invalid(format!(
-            "unsupported compression algorithm {algorithm}"
+        value => Err(invalid(format!(
+            "unsupported value {value:#x} in record header field +0x0c"
         ))),
     }
 }
@@ -765,43 +753,32 @@ fn process_inputs(
 
         let decoded_size = u64::try_from(plain.len())
             .map_err(|_| invalid("decoded record is too large for this platform"))?;
-        let sparse_size = header.plain_size - decoded_size;
-        let data_output_offset = if sparse_size == 0 || header.logical_offset == 0 {
-            if sparse_size != 0 {
-                eprintln!(
-                    "    SBCT sparse suffix: output {:#x}..{output_end:#x} \
-                     ({sparse_size:#x} zero bytes)",
-                    header.logical_offset + decoded_size
-                );
-            }
-            header.logical_offset
-        } else {
-            let data_offset = header.logical_offset + sparse_size;
+        let sparse_suffix_size = header.plain_size - decoded_size;
+        if sparse_suffix_size != 0 {
+            let sparse_start = header.logical_offset + decoded_size;
             eprintln!(
-                "    SBCT sparse prefix: output {:#x}..{data_offset:#x} \
-                 ({sparse_size:#x} zero bytes); decoded data starts at {data_offset:#x}",
-                header.logical_offset
+                "    SBCT sparse suffix: output {sparse_start:#x}..{output_end:#x} \
+                 ({sparse_suffix_size:#x} zero bytes)"
             );
-            data_offset
-        };
+        }
 
-        output.seek(SeekFrom::Start(data_output_offset))?;
+        output.seek(SeekFrom::Start(header.logical_offset))?;
         output.write_all(&plain)?;
         *maximum_output_end = (*maximum_output_end).max(output_end);
 
         println!(
-            "record {:5}  file {:#010x}  index {:5}  output {:#012x}..{:#012x}  \
-             decoded {:#x}/{:#x}  compressed {:#x}  algorithm {}  tag {:#018x}",
+            "record {:5}  file {:#010x}  unk0 {:#x}  output {:#012x}..{:#012x}  \
+             decoded {:#x}/{:#x}  compressed {:#x}  unk1 {:#x}  flags {:#06x}",
             *record_number,
             file_offset,
-            header.index,
+            header.unk0,
             header.logical_offset,
             output_end,
             plain.len(),
             header.plain_size,
             header.compressed_size,
-            header.algorithm,
-            header.tag
+            header.unk1,
+            header.flags
         );
 
         *record_number += 1;
