@@ -36,6 +36,8 @@ Basis: MS-XCA 2.1.4.3 (encoding), 2.2.4 (processing), 3.2 (public test vectors):
 https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/c7ec7ba9-ca8f-448f-bb85-027c1516db1c
 https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/26db8e62-bbd8-472c-a09e-623f6de10f0b
 https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/f59ff967-3032-4331-b108-0d2b4c09ee27
+
+Note: code written by chatgpt.
 """
 
 import argparse

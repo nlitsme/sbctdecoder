@@ -9,6 +9,8 @@ The format was reverse-engineered from observed recovery-image sets. It is not
 an official Microsoft implementation or a complete specification of every
 SBCT variant.
 
+The code in this project was mostly written by chatgpt.
+
 ## Files
 
 | File | Purpose |
